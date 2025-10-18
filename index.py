@@ -1,156 +1,150 @@
-import os
-import json
 import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from flask import Flask, request
+import firebase_admin
+from firebase_admin import credentials, db
 
-# ---- CONFIG ----
+app = Flask(__name__)
+
+# -------------------- CONFIG --------------------
 BOT_TOKEN = "8488024807:AAFXgBqDmoKRQdAWgPlOOTj9Lus-o1N1Hps"
 OWNER_ID = 8413382851
-CHANNELS = ["@legendxexpert", "@cyberexpertchat"]
+FIREBASE_URL = "https://legendxbot-686a2-default-rtdb.firebaseio.com/"
 API_URL = "https://legendxdata.site/Api/simdata.php?phone="
 
-REF_FILE = "referrals.json"
+# -------------------- FIREBASE SETUP --------------------
+try:
+    if not firebase_admin._apps:
+        cred = credentials.Certificate({
+            "type": "service_account",
+            "project_id": "legendxbot-686a2",
+            "private_key_id": "fake-key-id",
+            "private_key": "-----BEGIN PRIVATE KEY-----\nFAKEKEY\n-----END PRIVATE KEY-----\n",
+            "client_email": "firebase-adminsdk@legendxbot-686a2.iam.gserviceaccount.com",
+            "client_id": "1234567890",
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+            "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/firebase-adminsdk"
+        })
+        firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_URL})
+except Exception as e:
+    print("Firebase init error:", e)
 
-# ---- FUNCTIONS ----
-def load_referrals():
-    if not os.path.exists(REF_FILE):
-        with open(REF_FILE, "w") as f:
-            json.dump({}, f)
-    with open(REF_FILE, "r") as f:
-        return json.load(f)
 
-def save_referrals(data):
-    with open(REF_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+# -------------------- SEND MESSAGE --------------------
+def send_message(chat_id, text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    requests.post(url, json=payload)
 
-async def check_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    for ch in CHANNELS:
-        try:
-            member = await context.bot.get_chat_member(ch, user_id)
-            if member.status in ["left", "kicked"]:
-                return False
-        except:
-            return False
-    return True
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    user_id = str(user.id)
-    refs = load_referrals()
+# -------------------- FORMAT SIM INFO --------------------
+def format_sim_data(records):
+    if not records:
+        return "❌ No SIM records found for this number.\n🔁 Try with another number."
 
-    # Referral handling
-    if len(context.args) > 0:
-        ref_id = context.args[0]
-        if ref_id != user_id:
-            refs.setdefault(user_id, {"points": 0, "referred_by": ref_id})
-            refs.setdefault(ref_id, {"points": 0})
-            refs[ref_id]["points"] += 2
-            save_referrals(refs)
-
-    if user_id not in refs:
-        refs[user_id] = {"points": 0}
-        save_referrals(refs)
-
-    # Check if joined all channels
-    joined = await check_channels(update, context)
-    if not joined:
-        buttons = [[InlineKeyboardButton("Join Channel 1", url="https://t.me/legendxexpert")],
-                   [InlineKeyboardButton("Join Channel 2", url="https://t.me/cyberexpertchat")],
-                   [InlineKeyboardButton("✅ Joined Done", callback_data="joined_done")]]
-        await update.message.reply_text(
-            "⚠️ Please join both channels to use this bot:",
-            reply_markup=InlineKeyboardMarkup(buttons)
+    msg = "🎯 *SIM Information Received Successfully*\n━━━━━━━━━━━━━━━\n"
+    for r in records:
+        msg += (
+            f"📱 *Mobile:* `{r.get('Mobile', 'N/A')}`\n"
+            f"👤 *Name:* {r.get('Name', 'N/A')}\n"
+            f"🪪 *CNIC:* `{r.get('CNIC', 'N/A')}`\n"
+            f"🏠 *Address:* {r.get('Address', 'N/A')}\n"
+            f"🌍 *Country:* {r.get('Country', 'N/A')}\n"
+            "━━━━━━━━━━━━━━━\n"
         )
-        return
+    msg += "✅ *Status:* Successful\n"
+    return msg
 
-    refer_link = f"https://t.me/{context.bot.username}?start={user_id}"
-    await update.message.reply_text(
-        f"👋 Welcome {user.first_name}!\n\n"
-        f"📢 Share your refer link and earn 2 points per user:\n"
-        f"{refer_link}\n\n"
-        f"💰 You currently have {refs[user_id]['points']} points.\n\n"
-        f"Send a 10 or 11 digit number (without 0) to get SIM info."
-    )
 
-async def joined_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    joined = await check_channels(query, context)
-    if not joined:
-        await query.edit_message_text("❌ You must join both channels first!")
-    else:
-        await query.edit_message_text("✅ Thanks! Now send any number (without 0) to get info.")
+# -------------------- POINT SYSTEM --------------------
+def get_user_points(uid):
+    ref = db.reference(f"users/{uid}/points")
+    pts = ref.get()
+    return pts if pts else 0
 
-async def add_points(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("⛔ Only the owner can use this command.")
-        return
 
-    try:
-        user_id = context.args[0]
-        amount = int(context.args[1])
-        refs = load_referrals()
-        refs.setdefault(user_id, {"points": 0})
-        refs[user_id]["points"] += amount
-        save_referrals(refs)
-        await update.message.reply_text(f"✅ Added {amount} points to {user_id}.")
-    except Exception as e:
-        await update.message.reply_text("⚠️ Usage: /addpoints <user_id> <amount>")
+def add_user_points(uid, points):
+    ref = db.reference(f"users/{uid}/points")
+    current = get_user_points(uid)
+    ref.set(current + points)
 
-async def my_points(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    refs = load_referrals()
-    points = refs.get(user_id, {"points": 0})["points"]
-    await update.message.reply_text(f"💰 You currently have {points} points.")
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    text = update.message.text.strip()
-    refs = load_referrals()
+# -------------------- WEBHOOK --------------------
+@app.route("/", methods=["POST", "GET"])
+def webhook():
+    if request.method == "POST":
+        data = request.get_json()
+        if "message" not in data:
+            return "ok"
 
-    if not text.isdigit():
-        await update.message.reply_text("⚠️ Please send a valid phone number without 0.")
-        return
+        msg = data["message"]
+        chat_id = msg["chat"]["id"]
+        text = msg.get("text", "").strip()
 
-    refs.setdefault(user_id, {"points": 0})
-    if refs[user_id]["points"] < 4:
-        await update.message.reply_text("❌ You need 4 points to get info. Refer friends to earn more!")
-        return
+        # START Command
+        if text == "/start":
+            send_message(chat_id,
+                "👋 *Welcome to LegendX SIM Info Bot!*\n\n"
+                "➡️ Join our official channels to use this bot:\n"
+                "🔗 [Legend Expert](https://t.me/legendxexpert)\n"
+                "🔗 [Cyber Expert Chat](https://t.me/cyberexpertchat)\n\n"
+                "After joining, send any *mobile number* to get SIM details 📲"
+            )
+            return "ok"
 
-    try:
-        response = requests.get(API_URL + text)
-        data = response.json()
+        # HELP Command
+        if text == "/help":
+            send_message(chat_id, "💡 Just send a phone number (without 0) to get SIM data.")
+            return "ok"
 
-        if not data or "number" not in data:
-            raise Exception("Invalid data")
+        # ADMIN Add Points
+        if text.startswith("/addpoints") and str(chat_id) == str(OWNER_ID):
+            try:
+                _, uid, pts = text.split()
+                add_user_points(uid, int(pts))
+                send_message(chat_id, f"✅ Added {pts} points to user {uid}.")
+            except Exception:
+                send_message(chat_id, "❌ Usage: /addpoints <user_id> <points>")
+            return "ok"
 
-        info = (
-            f"📱 **Number:** {data.get('number', 'N/A')}\n"
-            f"👤 **Name:** {data.get('name', 'N/A')}\n"
-            f"🪪 **CNIC:** {data.get('cnic', 'N/A')}\n"
-            f"🏠 **Address:** {data.get('address', 'N/A')}\n"
-            f"📶 **Operator:** {data.get('operator', 'N/A')}"
-        )
-        await update.message.reply_text(info, parse_mode="Markdown")
+        # REFERRAL System
+        if text.startswith("/ref"):
+            parts = text.split()
+            if len(parts) == 2:
+                ref_id = parts[1]
+                if ref_id != str(chat_id):
+                    add_user_points(ref_id, 2)
+                    send_message(ref_id, "🎉 You got +2 points from a new referral!")
+                    send_message(chat_id, "✅ You joined using referral successfully!")
+            return "ok"
 
-        refs[user_id]["points"] -= 4
-        save_referrals(refs)
+        # USER INFO (show points)
+        if text == "/points":
+            pts = get_user_points(chat_id)
+            send_message(chat_id, f"⭐ Your total points: {pts}")
+            return "ok"
 
-    except Exception as e:
-        await update.message.reply_text("❌ No data received or invalid number. Please try again later.")
+        # SIM INFO LOOKUP
+        if text.isdigit():
+            url = f"{API_URL}{text}"
+            try:
+                resp = requests.get(url, timeout=10)
+                js = resp.json()
+                if js.get("success") and "records" in js:
+                    send_message(chat_id, format_sim_data(js["records"]))
+                else:
+                    send_message(chat_id, "⚠️ No record found for this number.")
+            except Exception as e:
+                send_message(chat_id, "❌ Error fetching SIM info, try again later.")
+            return "ok"
 
-# ---- MAIN ----
-app = ApplicationBuilder().token(BOT_TOKEN).build()
+        # UNKNOWN
+        send_message(chat_id, "❌ Invalid command or input. Use /help to see options.")
+        return "ok"
 
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("addpoints", add_points))
-app.add_handler(CommandHandler("mypoints", my_points))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-app.add_handler(MessageHandler(filters.COMMAND, handle_message))
-app.add_handler(CommandHandler("joined_done", joined_done))
+    return "Bot is running fine!"
+
 
 if __name__ == "__main__":
-    print("✅ Bot running...")
-    app.run_polling()
+    app.run(debug=True)
